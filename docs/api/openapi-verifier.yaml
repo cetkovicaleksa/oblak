@@ -1,0 +1,319 @@
+openapi: "3.0.3"
+info:
+  title: Oblak – Code Verifier API
+  version: "1.0.0"
+  description: |
+    **Internal** service API consumed exclusively by the Oblak Server.
+    Not exposed to the public internet.
+
+    The Code Verifier runs a multi-stage analysis pipeline on uploaded Python
+    code before it is allowed to be executed inside a MicroVM:
+
+    1. **Anti-virus scan** – ClamAV (or equivalent) to detect known malware signatures.
+    2. **Static analysis** – Bandit / Semgrep rules to flag dangerous API usage,
+       network calls, filesystem access, etc.
+    3. **LLM analysis** – An AI model reviews the code for obfuscation, logic
+       bombs, data exfiltration patterns, and other threats that static tools miss.
+
+    The pipeline is asynchronous: the Server submits a job and polls for results.
+    The verifier calls back to the Server's internal webhook when a job finishes
+    (so the Server can update the function's status without continuous polling).
+
+servers:
+  - url: http://code-verifier:9000
+    description: Internal service (not publicly reachable)
+
+# ─────────────────────────────────────────────
+# SECURITY SCHEME
+# ─────────────────────────────────────────────
+components:
+  securitySchemes:
+    ServiceToken:
+      type: http
+      scheme: bearer
+      description: |
+        Static shared secret issued to the Server at deployment time.
+        Passed as `Authorization: Bearer <token>`.
+
+  # ─────────────────────────────────────────────
+  # SHARED SCHEMAS
+  # ─────────────────────────────────────────────
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+    JobStatus:
+      type: string
+      enum:
+        - queued
+        - running
+        - completed
+        - failed
+      description: Lifecycle state of a verification job.
+
+    StageResult:
+      type: object
+      required: [stage, passed, started_at, finished_at]
+      properties:
+        stage:
+          type: string
+          enum: [antivirus, static_analysis, llm_analysis]
+        passed:
+          type: boolean
+        summary:
+          type: string
+          description: Short verdict or top finding.
+        findings:
+          type: array
+          description: Individual issues found by this stage.
+          items:
+            $ref: '#/components/schemas/Finding'
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+        tool_output:
+          type: object
+          additionalProperties: true
+          description: Raw structured output from the underlying tool (for audit logging).
+
+    Finding:
+      type: object
+      required: [severity, message]
+      properties:
+        severity:
+          type: string
+          enum: [info, low, medium, high, critical]
+        message:
+          type: string
+          example: "Use of `os.system()` detected – prefer subprocess with shell=False"
+        location:
+          type: string
+          description: "File path and line number, e.g. `main.py:42`"
+          example: "main.py:42"
+        rule_id:
+          type: string
+          description: Identifier of the rule or signature that triggered this finding.
+          example: "B605"
+
+    VerificationJob:
+      type: object
+      required: [job_id, function_id, status, submitted_at]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        function_id:
+          type: string
+          format: uuid
+          description: Oblak function ID (for correlation).
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        overall_passed:
+          type: boolean
+          description: |
+            True only if **all** enabled stages passed.
+            Present once `status` is `completed` or `failed`.
+        stages:
+          type: array
+          items:
+            $ref: '#/components/schemas/StageResult'
+          description: Per-stage results, populated progressively.
+        submitted_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+
+    SubmitJobRequest:
+      type: object
+      required: [function_id, storage_key]
+      properties:
+        function_id:
+          type: string
+          format: uuid
+          description: Oblak function ID; echoed back in results for correlation.
+        storage_key:
+          type: string
+          description: |
+            MinIO object key pointing to the uploaded function bundle
+            (e.g. `functions/{function_id}/bundle.zip`).
+          example: "functions/01J2K3L4M5N6/bundle.zip"
+        callback_url:
+          type: string
+          format: uri
+          description: |
+            Optional webhook URL on the Server side.  When the job finishes the
+            Verifier will POST the completed `VerificationJob` to this URL.
+          example: "http://server:8080/internal/verifier-callback"
+        stages:
+          type: array
+          description: |
+            Stages to run.  Defaults to all three if omitted.
+            Useful for testing / disabling costly stages in development.
+          items:
+            type: string
+            enum: [antivirus, static_analysis, llm_analysis]
+          example: [antivirus, static_analysis, llm_analysis]
+
+    CallbackPayload:
+      type: object
+      description: |
+        Body the Verifier POSTs to `SubmitJobRequest.callback_url` on completion.
+      required: [job_id, function_id, status, overall_passed]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        function_id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        overall_passed:
+          type: boolean
+        stages:
+          type: array
+          items:
+            $ref: '#/components/schemas/StageResult'
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid service token.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Job not found.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    BadRequest:
+      description: Invalid request body.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalError:
+      description: Unexpected verifier error.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+# ─────────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────────
+security:
+  - ServiceToken: []
+
+paths:
+
+  # ════════════════════════════════════════════
+  # HEALTH
+  # ════════════════════════════════════════════
+  /health:
+    get:
+      operationId: GetVerifierHealth
+      summary: Liveness check
+      security: []
+      tags: [Health]
+      responses:
+        "200":
+          description: Verifier is healthy.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+
+  # ════════════════════════════════════════════
+  # VERIFICATION JOBS
+  # ════════════════════════════════════════════
+  /jobs:
+    post:
+      operationId: SubmitVerificationJob
+      summary: Submit a function bundle for verification
+      description: |
+        The Verifier downloads the bundle from MinIO using the provided
+        `storage_key`, then runs the configured analysis pipeline stages.
+
+        The call returns immediately with the new job record in `queued` status.
+        The Server should poll `GET /jobs/{job_id}` or wait for the callback.
+      tags: [Jobs]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitJobRequest'
+      responses:
+        "202":
+          description: Job accepted and queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerificationJob'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /jobs/{job_id}:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    get:
+      operationId: GetVerificationJob
+      summary: Poll verification job status
+      description: |
+        Returns the current state of the job.  Stage results are populated as
+        each stage completes, so partial results may be visible while the job
+        is still `running`.
+      tags: [Jobs]
+      responses:
+        "200":
+          description: Job found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerificationJob'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      operationId: CancelVerificationJob
+      summary: Cancel a queued or running verification job
+      description: |
+        Idempotent – cancelling an already-completed job returns 204 without error.
+        Cancellation does not delete the stored results.
+      tags: [Jobs]
+      responses:
+        "204":
+          description: Job cancelled (or was already complete).
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'

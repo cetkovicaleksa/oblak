@@ -1,0 +1,549 @@
+openapi: "3.0.3"
+info:
+  title: Oblak – Firecracker Orchestrator API
+  version: "1.0.0"
+  description: |
+    **Internal** service API consumed exclusively by the Oblak Server.
+    Not exposed to the public internet.
+
+    The Orchestrator manages the full lifecycle of Firecracker MicroVMs used to
+    execute user-submitted Python functions in isolation:
+
+    ```
+    Server ──POST /executions──► Orchestrator
+                                     │
+                                     ├─ start MicroVM  (firecracker-go-sdk)
+                                     ├─ vsock connect  (CID allocated per VM)
+                                     ├─ send build msg (pip install)
+                                     ├─ send exec  msg
+                                     │     │
+                                     │  Agent (PID 1 inside MicroVM)
+                                     │     ├─ stdout/stderr ──► output messages
+                                     │     └─ exit          ──► done message
+                                     ├─ collect output
+                                     ├─ stop MicroVM
+                                     └─ POST callback_url (if provided)
+    ```
+
+    ## MicroVM isolation guarantees
+    Each execution runs in a **dedicated, ephemeral MicroVM**:
+    - Read-only squashfs rootfs — no persistent filesystem state between runs.
+    - 512 MiB RAM, 1 vCPU by default (configurable per request).
+    - Network disabled unless explicitly requested (open item).
+    - Process group killed (`SIGKILL -pgid`) on completion or timeout.
+    - `syscall.Sync()` called before shutdown to flush any writable overlays.
+
+    ## Wire protocol to the Agent (vsock, port 6000)
+    The Orchestrator speaks a newline-delimited JSON protocol over vsock with
+    the in-VM agent.  Each message is a JSON object on a single line.
+
+    **Orchestrator → Agent:**
+    | `type` | Purpose |
+    |---|---|
+    | `build` | Install dependencies from `requirements.txt` via pip. |
+    | `exec`  | Run `main.py` (or the inline code). |
+
+    **Agent → Orchestrator:**
+    | `type`   | Fields | Purpose |
+    |---|---|---|
+    | `output` | `channel` (`stdout`\|`stderr`\|`system`), `data` | Streamed output line. |
+    | `done`   | `exit_code` | Process has exited; VM will shut down. |
+    | `error`  | `error` | Agent-level error (e.g. pip failed). |
+
+servers:
+  - url: http://orchestrator:9100
+    description: Internal service (not publicly reachable)
+
+# ─────────────────────────────────────────────
+# SECURITY
+# ─────────────────────────────────────────────
+components:
+  securitySchemes:
+    ServiceToken:
+      type: http
+      scheme: bearer
+      description: |
+        Static shared secret issued to the Server at deployment time.
+        `Authorization: Bearer <token>`
+
+  # ─────────────────────────────────────────────
+  # SHARED SCHEMAS
+  # ─────────────────────────────────────────────
+  schemas:
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+    # ── Execution lifecycle ────────────────────
+    ExecutionStatus:
+      type: string
+      enum:
+        - pending    # accepted, VM not yet started
+        - building   # VM running, pip installing dependencies
+        - running    # code is executing inside the VM
+        - succeeded  # process exited with code 0
+        - failed     # process exited with non-zero code, or agent error
+        - timeout    # wall-clock limit exceeded; VM was forcibly stopped
+        - cancelled  # cancelled by the Server before completion
+      description: Lifecycle state of a single code execution.
+
+    OutputLine:
+      type: object
+      required: [channel, data, seq]
+      properties:
+        seq:
+          type: integer
+          description: Monotonically increasing sequence number (for ordered replay).
+        channel:
+          type: string
+          enum: [stdout, stderr, system]
+          description: |
+            `stdout` / `stderr` come from the Python process.
+            `system` comes from the agent itself (e.g. "Execution started").
+        data:
+          type: string
+          description: One line of output (newline already stripped by the agent).
+
+    ResourceLimits:
+      type: object
+      description: |
+        MicroVM resource allocation for this execution.
+        Defaults are conservative; the Server may tighten or loosen them based
+        on the user's plan.
+      properties:
+        memory_mib:
+          type: integer
+          default: 512
+          minimum: 128
+          maximum: 4096
+          description: RAM allocated to the MicroVM in MiB.
+        vcpu_count:
+          type: integer
+          default: 1
+          minimum: 1
+          maximum: 4
+          description: Number of vCPUs allocated to the MicroVM.
+        timeout_seconds:
+          type: integer
+          default: 30
+          minimum: 1
+          maximum: 300
+          description: |
+            Wall-clock execution timeout in seconds.  The timer starts when the
+            `exec` message is sent to the agent.  On expiry the VM is stopped
+            immediately and the execution transitions to `timeout`.
+
+    Execution:
+      type: object
+      required: [execution_id, function_id, status, submitted_at]
+      properties:
+        execution_id:
+          type: string
+          format: uuid
+        function_id:
+          type: string
+          format: uuid
+          description: Oblak function ID; echoed from the request for correlation.
+        status:
+          $ref: '#/components/schemas/ExecutionStatus'
+        exit_code:
+          type: integer
+          description: |
+            OS exit code of the Python process.
+            Present only when `status` is `succeeded` or `failed`.
+        output:
+          type: array
+          items:
+            $ref: '#/components/schemas/OutputLine'
+          description: |
+            Buffered output lines in sequence order.
+            Present when `status` is terminal (`succeeded`, `failed`, `timeout`).
+            Empty array means the process produced no output.
+        vm_id:
+          type: string
+          format: uuid
+          description: Internal Firecracker VM identifier (useful for log correlation).
+        vm_log_path:
+          type: string
+          description: |
+            Path on the Orchestrator host where the raw Firecracker log was written
+            (e.g. `/tmp/vm-<uuid>.log`).  Exposed for debugging only.
+          example: "/tmp/vm-01J2K3L4M5N6.log"
+        submitted_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+          description: When the MicroVM finished booting and exec began.
+        finished_at:
+          type: string
+          format: date-time
+          description: When the process exited or the timeout fired.
+
+    # ── Request ────────────────────────────────
+    CreateExecutionRequest:
+      type: object
+      required: [function_id, storage_key]
+      properties:
+        function_id:
+          type: string
+          format: uuid
+          description: |
+            Oblak function ID. Echoed back in all responses and the callback
+            so the Server can route results to the right function record.
+        storage_key:
+          type: string
+          description: |
+            MinIO object key for the verified function bundle.
+            The Orchestrator fetches this object, extracts `main.py` (and
+            optionally `requirements.txt`), and injects them into the MicroVM
+            via a writable overlay before sending the `build` / `exec` messages.
+          example: "functions/01J2K3L4M5N6/bundle.zip"
+        env:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Environment variables injected into the MicroVM before execution.
+            The agent sets these via `os.Setenv` before spawning `python3`.
+          example:
+            MY_API_KEY: "secret"
+            LOG_LEVEL: "info"
+        limits:
+          $ref: '#/components/schemas/ResourceLimits'
+        callback_url:
+          type: string
+          format: uri
+          description: |
+            Optional webhook on the Server side.  When the execution reaches a
+            terminal status the Orchestrator POSTs the completed `Execution`
+            object to this URL.
+          example: "http://server:8080/internal/execution-callback"
+
+    # ── Callback ───────────────────────────────
+    ExecutionCallback:
+      type: object
+      description: |
+        Body POSTed to `CreateExecutionRequest.callback_url` on completion.
+        Identical structure to `Execution`; provided separately for clarity.
+      required: [execution_id, function_id, status]
+      properties:
+        execution_id:
+          type: string
+          format: uuid
+        function_id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/ExecutionStatus'
+        exit_code:
+          type: integer
+        output:
+          type: array
+          items:
+            $ref: '#/components/schemas/OutputLine'
+        vm_id:
+          type: string
+          format: uuid
+        submitted_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+
+    # ── Pool metrics (observability) ───────────
+    PoolStats:
+      type: object
+      description: |
+        Snapshot of the internal MicroVM pool state.
+        Useful for capacity planning, autoscaling decisions, and dashboards.
+      required: [running_vms, pending_executions, total_executions_all_time]
+      properties:
+        running_vms:
+          type: integer
+          description: Number of MicroVMs currently booted and executing code.
+        pending_executions:
+          type: integer
+          description: Number of executions waiting for a VM slot.
+        total_executions_all_time:
+          type: integer
+          description: Lifetime counter of completed executions (including failed/timed out).
+        avg_boot_time_ms:
+          type: number
+          description: Rolling average MicroVM boot-to-exec time in milliseconds.
+        avg_exec_time_ms:
+          type: number
+          description: Rolling average execution wall-clock time in milliseconds.
+
+  # ── Shared responses ──────────────────────────
+  responses:
+    Unauthorized:
+      description: Missing or invalid service token.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Execution not found.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    BadRequest:
+      description: Invalid request body or parameters.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: Execution is in a state that does not allow this operation.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalError:
+      description: Unexpected orchestrator-side error (VM failed to start, vsock error, etc.).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+# ─────────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────────
+security:
+  - ServiceToken: []
+
+paths:
+
+  # ════════════════════════════════════════════
+  # HEALTH  (public – no auth)
+  # ════════════════════════════════════════════
+  /health:
+    get:
+      operationId: GetOrchestratorHealth
+      summary: Liveness check
+      description: Returns 200 when the orchestrator is up and Firecracker is reachable.
+      security: []
+      tags: [Health]
+      responses:
+        "200":
+          description: Healthy.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+                  firecracker_binary:
+                    type: string
+                    description: Path to the firecracker binary found on PATH.
+                    example: "/usr/bin/firecracker"
+
+  # ════════════════════════════════════════════
+  # EXECUTIONS
+  # ════════════════════════════════════════════
+  /executions:
+    post:
+      operationId: CreateExecution
+      summary: Submit a function for execution in a MicroVM
+      description: |
+        The Orchestrator:
+        1. Generates a unique `execution_id` and returns it immediately (`pending`).
+        2. Allocates a vsock CID and starts a Firecracker MicroVM.
+        3. Connects to the agent over vsock (retries up to 20×, 500 ms apart).
+        4. If `requirements.txt` is present in the bundle, sends a `build` message
+           and waits for acknowledgement before proceeding (`building` status).
+        5. Sends an `exec` message; transitions to `running`.
+        6. Streams `output` messages into an internal buffer.
+        7. On `done` or timeout, stops the VM, persists results, transitions to
+           terminal status, and fires the callback if configured.
+      tags: [Executions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateExecutionRequest'
+      responses:
+        "202":
+          description: Execution accepted; VM is being provisioned asynchronously.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Execution'
+          headers:
+            Location:
+              description: URL to poll for execution status.
+              schema:
+                type: string
+                example: "/executions/01J2K3L4M5N6O7P8"
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /executions/{execution_id}:
+    parameters:
+      - name: execution_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    get:
+      operationId: GetExecution
+      summary: Poll execution status and retrieve results
+      description: |
+        Returns the current state of the execution.  Output lines are buffered
+        server-side and returned in full once the execution is terminal.
+
+        **Recommended polling interval:** 500 ms while `status` is non-terminal;
+        no further polling needed once `status` is `succeeded`, `failed`,
+        `timeout`, or `cancelled`.
+
+        For real-time output use `GET /executions/{execution_id}/output/stream`
+        (SSE) instead of polling this endpoint.
+      tags: [Executions]
+      responses:
+        "200":
+          description: Execution record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Execution'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      operationId: CancelExecution
+      summary: Cancel a pending or running execution
+      description: |
+        - `pending` → removed from queue, transitions to `cancelled`.
+        - `running` / `building` → VM is stopped immediately (SIGKILL on the
+          Firecracker process), transitions to `cancelled`.
+        - Terminal states → 409 Conflict; the execution is already complete.
+
+        Cancellation is best-effort: a brief race between completion and
+        cancellation may result in the execution reaching a terminal state before
+        the cancel is processed.  Always check the returned status.
+      tags: [Executions]
+      responses:
+        "200":
+          description: Execution cancelled. Body contains the final record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Execution'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "409":
+          $ref: '#/components/responses/Conflict'
+
+  # ════════════════════════════════════════════
+  # REAL-TIME OUTPUT STREAM  (SSE)
+  # ════════════════════════════════════════════
+  /executions/{execution_id}/output/stream:
+    parameters:
+      - name: execution_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    get:
+      operationId: StreamExecutionOutput
+      summary: Stream execution output in real time (Server-Sent Events)
+      description: |
+        Opens a long-lived SSE connection and forwards `output` messages from the
+        agent as they arrive over the vsock connection, in sequence order.
+
+        Each SSE event has:
+        - `event`: one of `output`, `done`, `error`
+        - `data`: JSON-serialised `OutputLine` (for `output`) or `Execution`
+          summary (for `done` / `error`)
+
+        The stream is closed by the server when the execution reaches a terminal
+        state.  Clients should reconnect using the `Last-Event-ID` header if the
+        connection drops mid-execution.
+
+        Example SSE stream:
+        ```
+        event: output
+        data: {"seq":1,"channel":"system","data":"Execution started"}
+
+        event: output
+        data: {"seq":2,"channel":"stdout","data":"Hello, world!"}
+
+        event: done
+        data: {"execution_id":"...","status":"succeeded","exit_code":0}
+        ```
+      tags: [Executions]
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema:
+            type: integer
+          description: |
+            Resume from this sequence number. The Orchestrator replays buffered
+            lines with `seq > Last-Event-ID` before switching to live forwarding.
+      responses:
+        "200":
+          description: SSE stream opened.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: Newline-delimited SSE events.
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "409":
+          description: Execution is already in a terminal state; use GET instead.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ════════════════════════════════════════════
+  # POOL METRICS  (observability)
+  # ════════════════════════════════════════════
+  /metrics:
+    get:
+      operationId: GetPoolMetrics
+      summary: Get MicroVM pool statistics
+      description: |
+        Returns a point-in-time snapshot of the orchestrator's internal state.
+        Intended for dashboards, alerting, and autoscaling decisions.
+      tags: [Metrics]
+      responses:
+        "200":
+          description: Pool statistics.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PoolStats'
+        "401":
+          $ref: '#/components/responses/Unauthorized'

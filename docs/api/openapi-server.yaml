@@ -1,0 +1,658 @@
+openapi: "3.0.3"
+info:
+  title: Oblak – Server API
+  version: "1.0.0"
+  description: |
+    Primary HTTP API of the Oblak platform. Consumed by the CDK CLI for function
+    management and by any HTTP client (e.g. cURL) for function invocation.
+
+    ## Authentication
+    All endpoints except `GET /health` require a Bearer API key.
+
+    ### Header format
+    ```
+    Authorization: Bearer oblak_sk_v1_<base64url>
+    ```
+
+    Keys are created with `POST /auth-keys` and stored by the CDK CLI.
+    The server hashes the incoming token with SHA-256 and looks it up in the
+    database — no request signing, no timestamp header required.
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+# ─────────────────────────────────────────────
+# SECURITY SCHEME
+# ─────────────────────────────────────────────
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: http
+      scheme: bearer
+      description: |
+        API key issued via `POST /auth-keys` and stored by the CDK CLI in
+        `~/.oblak/config.toml`.
+
+        Header format:
+        ```
+        Authorization: Bearer oblak_sk_v1_<32-random-bytes-base64url>
+        ```
+
+        The server never stores the raw token. On receipt it computes
+        `hex(SHA-256(token))` and compares it against the stored hash — a
+        single indexed DB lookup. No signing, no timestamp header, no
+        canonical string.
+
+        Tokens are long-lived and do not expire. Revoke them explicitly with
+        `DELETE /auth-keys/{auth_id}`.
+
+  # ─────────────────────────────────────────────
+  # SHARED SCHEMAS
+  # ─────────────────────────────────────────────
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          example: "not found"
+
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          example: "ok"
+
+    # ── Auth keys ──────────────────────────────
+    AuthKeyCreated:
+      type: object
+      required: [auth_id, raw_token]
+      properties:
+        auth_id:
+          type: string
+          description: Opaque identifier for this key (use it to revoke the key later).
+          example: "key_dGhpcyBpcyBh"
+        raw_token:
+          type: string
+          description: |
+            The bearer token to store in `~/.oblak/config.toml`.
+            Returned **only once** — the server stores only a SHA-256 hash
+            and cannot recover this value.
+          example: "oblak_sk_v1_3q2-7u_abc123XYZ"
+
+    AuthKeySummary:
+      type: object
+      required: [auth_id, created_at]
+      properties:
+        auth_id:
+          type: string
+          example: "key_01J2K3L4M5"
+        created_at:
+          type: string
+          format: date-time
+
+    # ── Functions ──────────────────────────────
+    FunctionStatus:
+      type: string
+      enum:
+        - pending       # uploaded, not yet verified
+        - verifying     # code verifier is running
+        - ready         # verified and ready to invoke
+        - failed        # verification or prep failed
+      description: Lifecycle state of a deployed function.
+
+    Function:
+      type: object
+      required: [function_id, name, status, created_at, invoke_url]
+      properties:
+        function_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          example: "my-function"
+        description:
+          type: string
+          example: "Computes Fibonacci numbers"
+        status:
+          $ref: '#/components/schemas/FunctionStatus'
+        verification_report:
+          $ref: '#/components/schemas/VerificationReport'
+        invoke_url:
+          type: string
+          format: uri
+          description: |
+            Stable URL that triggers execution of this function.
+            Callers hit this with a POST request (no CLI auth needed –
+            function-level API key auth is used instead).
+          example: "http://localhost:8080/invoke/01J2K3L4M5N6"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    VerificationReport:
+      type: object
+      description: Summary of all analysis passes performed on the uploaded code.
+      properties:
+        antivirus:
+          $ref: '#/components/schemas/CheckResult'
+        static_analysis:
+          $ref: '#/components/schemas/CheckResult'
+        llm_analysis:
+          $ref: '#/components/schemas/CheckResult'
+        overall_passed:
+          type: boolean
+
+    CheckResult:
+      type: object
+      required: [passed]
+      properties:
+        passed:
+          type: boolean
+        summary:
+          type: string
+          description: Human-readable verdict or finding list.
+        details:
+          type: object
+          additionalProperties: true
+          description: Tool-specific structured output.
+
+    FunctionList:
+      type: object
+      required: [functions]
+      properties:
+        functions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Function'
+
+    # ── Invocations ────────────────────────────
+    InvocationStatus:
+      type: string
+      enum:
+        - running
+        - succeeded
+        - failed
+        - timeout
+
+    Invocation:
+      type: object
+      required: [invocation_id, function_id, status, started_at]
+      properties:
+        invocation_id:
+          type: string
+          format: uuid
+        function_id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/InvocationStatus'
+        exit_code:
+          type: integer
+          description: OS exit code of the Python process (present when status != running).
+        stdout:
+          type: string
+          description: Captured standard output (present when status != running).
+        stderr:
+          type: string
+          description: Captured standard error (present when status != running).
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+
+    InvocationRequest:
+      type: object
+      properties:
+        env:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Optional environment variables injected into the MicroVM before execution.
+            Sensitive values should be passed this way rather than hard-coded in the function.
+
+  # ── Shared responses ──────────────────────────
+  responses:
+    Unauthorized:
+      description: Missing, malformed, or unrecognised Bearer token.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Authenticated user does not own this resource.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    BadRequest:
+      description: Invalid request payload or parameters.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: Resource already exists or is in a conflicting state.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalError:
+      description: Unexpected server-side error.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+# ─────────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────────
+security:
+  - ApiKeyAuth: []
+
+paths:
+
+  # ════════════════════════════════════════════
+  # HEALTH  (public – no auth)
+  # ════════════════════════════════════════════
+  /health:
+    get:
+      operationId: GetHealth
+      summary: Liveness check
+      description: Returns 200 when the server is up. No authentication required.
+      security: []
+      tags: [Health]
+      responses:
+        "200":
+          description: Server is healthy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  # ════════════════════════════════════════════
+  # AUTH KEYS  (CLI authentication)
+  # ════════════════════════════════════════════
+  /auth-keys:
+    post:
+      operationId: CreateAuthKey
+      summary: Create an auth key
+      description: |
+        Generates a new API key for the calling user.
+        The `raw_token` is returned **only once** and must be stored by the
+        CDK CLI immediately (e.g. in `~/.oblak/config.toml`).
+      tags: [Auth Keys]
+      responses:
+        "201":
+          description: Key created successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthKeyCreated'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+    get:
+      operationId: ListAuthKeys
+      summary: List auth keys for the current user
+      tags: [Auth Keys]
+      responses:
+        "200":
+          description: List of auth key summaries (secrets are never returned).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [auth_keys]
+                properties:
+                  auth_keys:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AuthKeySummary'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth-keys/{auth_id}:
+    parameters:
+      - name: auth_id
+        in: path
+        required: true
+        schema:
+          type: string
+
+    delete:
+      operationId: RevokeAuthKey
+      summary: Revoke an auth key
+      description: Immediately invalidates the key. In-flight requests that have already
+        passed the timestamp check may still complete.
+      tags: [Auth Keys]
+      responses:
+        "204":
+          description: Key revoked.
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  # ════════════════════════════════════════════
+  # FUNCTIONS  (upload / manage)
+  # ════════════════════════════════════════════
+  /functions:
+    post:
+      operationId: UploadFunction
+      summary: Upload a Python function
+      description: |
+        Accepts a multipart upload containing the function source code and an
+        optional `requirements.txt`.  The server stores the files in MinIO, then
+        asynchronously kicks off the Code Verifier pipeline.
+
+        **Multipart fields:**
+        | Field | Required | Description |
+        |---|---|---|
+        | `name` | ✓ | Human-readable function name (unique per user). |
+        | `description` | | Optional description. |
+        | `code` | ✓ | `main.py` file **or** a `.zip` archive containing `main.py` at its root. |
+        | `requirements` | | `requirements.txt` (plain text). |
+
+        The function enters `pending` status immediately; poll
+        `GET /functions/{function_id}` for verification progress.
+      tags: [Functions]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [name, code]
+              properties:
+                name:
+                  type: string
+                  maxLength: 64
+                  pattern: '^[a-z0-9][a-z0-9\-]{0,62}[a-z0-9]$'
+                  example: "fibonacci"
+                description:
+                  type: string
+                  maxLength: 256
+                code:
+                  type: string
+                  format: binary
+                  description: "main.py or a .zip containing main.py"
+                requirements:
+                  type: string
+                  format: binary
+                  description: "requirements.txt (optional)"
+      responses:
+        "202":
+          description: Function accepted and queued for verification.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Function'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "409":
+          $ref: '#/components/responses/Conflict'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+    get:
+      operationId: ListFunctions
+      summary: List functions owned by the current user
+      tags: [Functions]
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/FunctionStatus'
+          description: Filter by lifecycle status.
+      responses:
+        "200":
+          description: Paginated list of functions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FunctionList'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+
+  /functions/{function_id}:
+    parameters:
+      - name: function_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    get:
+      operationId: GetFunction
+      summary: Get function details
+      description: Returns current status, verification report, and the invoke URL.
+      tags: [Functions]
+      responses:
+        "200":
+          description: Function found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Function'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      operationId: DeleteFunction
+      summary: Delete a function
+      description: |
+        Removes the function record, its stored code from MinIO, and invalidates
+        its invoke URL.  Running invocations are not terminated immediately.
+      tags: [Functions]
+      responses:
+        "204":
+          description: Function deleted.
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  # ════════════════════════════════════════════
+  # INVOCATIONS  (run the code)
+  # ════════════════════════════════════════════
+  /invoke/{invoke_token}:
+    post:
+      operationId: InvokeFunction
+      summary: Invoke a function via its public URL
+      description: |
+        This is the **stable public endpoint** embedded in `Function.invoke_url`.
+        Authentication uses a per-function token embedded in the URL path, so any
+        HTTP client (e.g. cURL) can call it without an API key.
+
+        The server:
+        1. Resolves the token to a `function_id` and verifies the function is in `ready` status.
+        2. Delegates execution to the **Firecracker Orchestrator** (`POST /executions`)
+           passing the MinIO `storage_key`, optional env vars, and a callback URL pointing
+           back to `POST /internal/execution-callback`.
+        3. **Synchronous mode (`async=false`, default):** waits for the callback (or polls
+           the Orchestrator) and returns the buffered output once the execution is terminal.
+        4. **Async mode (`async=true`):** returns the `invocation_id` immediately; the
+           client polls `GET /functions/{function_id}/invocations/{invocation_id}`.
+      tags: [Invocations]
+      security: []       # Token is in the path, no API key needed
+      parameters:
+        - name: invoke_token
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Opaque token embedded in the function's `invoke_url`.
+        - name: async
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: |
+            If `true`, return immediately with an `invocation_id` and poll
+            `GET /functions/{function_id}/invocations/{invocation_id}` for results.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvocationRequest'
+      responses:
+        "200":
+          description: |
+            Synchronous result (when `async=false`).  Returned only when the
+            function exits within the timeout.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Invocation'
+        "202":
+          description: |
+            Async invocation accepted (`async=true`).
+            Poll `GET /functions/{function_id}/invocations/{invocation_id}`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [invocation_id]
+                properties:
+                  invocation_id:
+                    type: string
+                    format: uuid
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "409":
+          description: Function is not in `ready` status and cannot be invoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        "500":
+          $ref: '#/components/responses/InternalError'
+        "504":
+          description: Function execution timed out.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /functions/{function_id}/invocations:
+    parameters:
+      - name: function_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    get:
+      operationId: ListInvocations
+      summary: List past invocations of a function
+      tags: [Invocations]
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/InvocationStatus'
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+      responses:
+        "200":
+          description: List of invocations.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [invocations]
+                properties:
+                  invocations:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Invocation'
+                  total:
+                    type: integer
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  /functions/{function_id}/invocations/{invocation_id}:
+    parameters:
+      - name: function_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: invocation_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    get:
+      operationId: GetInvocation
+      summary: Get invocation result
+      description: |
+        Poll this endpoint after an async invocation to retrieve status, logs,
+        and the exit code.
+      tags: [Invocations]
+      responses:
+        "200":
+          description: Invocation record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Invocation'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "404":
+          $ref: '#/components/responses/NotFound'
